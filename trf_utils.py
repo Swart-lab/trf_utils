@@ -25,6 +25,7 @@ parser.add_argument(
     help="""
     Report GFF without overlaps: if features overlap, pick highest scoring
     feature. In case of tied score, pick feature with the most repeat copies.
+    Requires `bedtools cluster` in path.
     """)
 parser.add_argument(
     "-o", "--out", type=str, default="test_out",
