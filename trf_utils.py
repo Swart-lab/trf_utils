@@ -4,7 +4,7 @@ import re
 import json
 import argparse
 import tempfile
-import logging
+# import logging
 from subprocess import run
 from collections import defaultdict
 
@@ -12,7 +12,7 @@ parser = argparse.ArgumentParser(
     description="Reformat output from TRF",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument(
-    "input", metavar="INPUT", type=str,
+    "--input", type=str,
     help="Input dat or ngs file from TRF")
 parser.add_argument(
     "--format", type=str, default="ngs",
@@ -38,19 +38,12 @@ parser.add_argument(
     in the original TRF output.
     """)
 
-logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig(level=logging.DEBUG)
 
 NGSFIELDS = ["start", "end", "per_len", "num_copies", "cons_len",
              "adj_pc_match", "adj_pc_indel", "aln_score",
              "pc_A", "pc_C", "pc_G", "pc_T", "entropy", "cons_seq",
              "seq_region", "flank_left", "flank_right"]
-
-
-def check_env():
-    out = {}
-    bedtools_vers = run(["bedtools", "--version"], capture_output=True)
-    out['bedtools'] = bedtools_vers.stdout.decode().rstrip()
-    return(out)
 
 
 def parse_ngs(filename):
@@ -73,6 +66,64 @@ def parse_ngs(filename):
                 if int(linedict['end']) - int(linedict['start']) + 1 > args.min_length:
                     out[current_record].append(linedict)
     fh.close()
+    return(out)
+
+
+def filter_overlaps(recs):
+    """Filter TRF output records for overlapping features
+
+    Drop features that are completely contained in another feature.  If two
+    features overlap exactly (same start and end coordinates), pick the one
+    with a higher alignment score. If both have the same alignment score, pick
+    the one with more copies (i.e. shorter repeat period).  If two features
+    overlap, keep both.
+
+    Parameters
+    ----------
+    recs : dict
+        Output from parse_args()
+
+    Returns
+    -------
+    dict
+        Same structure as input recs but with overlapping and duplicate
+        features removed
+    """
+    out = {}
+    for seqid in recs:
+        # sort by start and end position
+        recs[seqid] = sorted(recs[seqid], key=lambda x: int(x['start']))
+        outstack = [] # store all entries
+        for rec in recs[seqid]:
+            if len(outstack) == 0:
+                outstack.append(rec)
+            else:
+                if int(rec['start']) == int(outstack[-1]['start']):
+                    if int(rec['end']) == int(outstack[-1]['end']):
+                        # if coordinates overlap entirely
+                        if float(rec['aln_score']) > float(outstack[-1]['aln_score']):
+                            # pick higher scoring
+                            discard = outstack.pop()
+                            outstack.append(rec)
+                        elif float(rec['aln_score']) == float(outstack[-1]['aln_score']):
+                            # if scores identical
+                            if float(rec['num_copies']) > float(outstack[-1]['num_copies']):
+                                # pick repeat with more copies (i.e. shorter period)
+                                discard = outstack.pop()
+                                outstack.append(rec)
+                    elif int(rec['end']) > int(outstack[-1]['end']):
+                        # new record is entirely contained in old record
+                        discard = outstack.pop()
+                        outstack.append(rec)
+                elif int(rec['start']) > int(outstack[-1]['start']):
+                    if int(rec['start']) > int(outstack[-1]['end']):
+                        # new record starts after old record, no overlap
+                        # use > instead of >= because coordinates are end-inclusive
+                        outstack.append(rec)
+                    elif int(rec['end']) > int(outstack[-1]['end']):
+                        # new record overlaps with old record
+                        outstack.append(rec)
+        out[seqid] = outstack
     return(out)
 
 
@@ -138,62 +189,8 @@ def report_gff(recs, filename):
     fh.close()
 
 
-def report_gff_no_overlaps(recs, filename):
-    """Pick best-scoring repeat region in case of overlaps
-
-    Use bedtools cluster to generate overlap clusters
-    For each cluster, pick repeat feature with highest alignment score
-    If scores are tied, pick feature with the most repeat num_copies
-    """
-    # cluster overlapping features with bedtools cluster
-    tf = tempfile.NamedTemporaryFile()
-    report_gff(recs, tf.name)
-    clusts = run(['bedtools','cluster','-i',tf.name],capture_output=True)
-    tf.close()
-    clusts = clusts.stdout.decode().split("\n")  # break on lines
-    clusts = [line.split("\t") for line in clusts if line != ""]  # transform to list of lists
-    # group by cluster number
-    cd = defaultdict(list)
-    for rec in clusts:
-        cd[rec[9]].append(rec)
-    # get highest scoring aln per cluster
-    # TODO edge case where we have bookended features that are assigned to same cluster
-    out = {}
-    for clustid in cd:
-        if len(cd[clustid]) == 1:
-            logging.debug(
-                f"cluster {str(clustid)} has only one member")
-            out[clustid] = cd[clustid][0]
-        else:
-            topscore = [rec for rec in cd[clustid] if int(rec[5]) == max([int(r[5]) for r in cd[clustid]])]
-            if len(topscore) == 1:
-                logging.debug(
-                    f"cluster {str(clustid)} has {str(len(cd[clustid]))} members, single top score")
-                out[clustid] = topscore[0]
-            else:
-                ncmatches = []
-                for rec in topscore:
-                    ncmatch = re.search(r"num_copies=([^;]+);", rec[8])
-                    ncmatch = float(ncmatch.group(1))
-                    ncmatches.append((ncmatch, rec))
-                # report record with highest num_copies
-                logging.debug(
-                    f"cluster {str(clustid)} has {str(len(cd[clustid]))} members, tied top score, picking highest num_copies")
-                out[clustid] = sorted(ncmatches, key=lambda x: float(x[0]), reverse=True)[0][1]
-    # write to file
-    fh = open(filename, "w")
-    fh.write("##gff-version-3\n")
-    for clustid in out:
-        fh.write("\t".join(out[clustid][0:9]) + "\n")  # strip cluster ID: last item in list
-    fh.close()
-
-
 if __name__ == "__main__":
     args = parser.parse_args()
-
-    depvers = check_env()
-    logging.debug(
-        "Dependencies: " + " ".join([f"{tool}:{depvers[tool]}" for tool in depvers]))
 
     if args.input:
         recs = None
@@ -203,11 +200,10 @@ if __name__ == "__main__":
             print("not yet implemented")
         # Report output
         if recs:
+            if args.no_overlaps:
+                recs = filter_overlaps(recs)
             if args.outfmt == "tsv":
                 report_tsv(recs, args.out)
             elif args.outfmt == "gff":
-                if args.no_overlaps:
-                    report_gff_no_overlaps(recs, args.out)
-                else:
-                    report_gff(recs, args.out)
+                report_gff(recs, args.out)
 
